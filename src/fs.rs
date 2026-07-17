@@ -24,11 +24,11 @@ pub struct DirEntry {
 }
 
 /// Файловая система, представляемая в Finder. Всё read-only (решение №5).
-pub trait Filesystem: Send {
-    /// inode корневого каталога (в FUSE традиционно 1).
-    fn root_ino(&self) -> u64 {
-        1
-    }
+///
+/// Без `Send`: `fuser::mount2` работает в одном потоке, а на шаге 3 реализация
+/// (fatfs держит `&'static dyn TimeProvider`, не `Sync`) будет жить целиком
+/// внутри потока-актора и границу потоков не пересекать.
+pub trait Filesystem {
     fn getattr(&self, ino: u64) -> Option<Attr>;
     fn lookup(&self, parent: u64, name: &str) -> Option<Attr>;
     /// Дети каталога `ino` (без "." / "..").

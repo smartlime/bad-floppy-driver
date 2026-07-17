@@ -1,1 +1,4 @@
 /target
+
+# Генерируемые тестовые образы дискет (пересоздаются, см. tests/fixtures/README.md)
+/tests/fixtures/*.img

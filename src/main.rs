@@ -1,31 +1,79 @@
 //! floppy_mac — read-only macOS FUSE-драйвер для дискет через Greaseweazle.
 //!
-//! Шаг 1 (hello-FS): смонтировать том с одним синтетическим README.txt и
-//! снять риск совместимости `fuser` ↔ macFUSE 5 на macOS 26.
+//!   Шаг 1: hello-FS (синтетический README.txt).
+//!   Шаг 2: монтирование готового образа .img через крейт `fatfs`.
 //!
-//!   Использование:  floppy_mac <точка-монтирования>
+//!   Использование:
+//!     floppy_mac <точка-монтирования>                 # hello-FS
+//!     floppy_mac <точка-монтирования> --image f.img   # FAT12/16 из образа
 //!   Размонтировать: umount <точка-монтирования>   (или Ctrl-C)
 
 mod block_source;
+mod fatfs_fs;
 mod fs;
 mod fuse_adapter;
+mod image;
+mod volume_io;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use fuser::MountOption;
 
-use crate::fs::HelloFs;
+use crate::fatfs_fs::FatFs;
+use crate::fs::{Filesystem, HelloFs};
 use crate::fuse_adapter::FuseAdapter;
+use crate::image::ImageFile;
+
+struct Args {
+    mountpoint: String,
+    image: Option<PathBuf>,
+}
+
+fn parse_args() -> Option<Args> {
+    let mut mountpoint = None;
+    let mut image = None;
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--image" => image = Some(PathBuf::from(it.next()?)),
+            _ => mountpoint = Some(arg),
+        }
+    }
+    Some(Args {
+        mountpoint: mountpoint?,
+        image,
+    })
+}
 
 fn main() -> ExitCode {
     env_logger::init();
 
-    let Some(mountpoint) = std::env::args().nth(1) else {
-        eprintln!("usage: floppy_mac <mountpoint>");
+    let Some(args) = parse_args() else {
+        eprintln!("usage: floppy_mac <mountpoint> [--image <path>]");
         return ExitCode::FAILURE;
     };
 
-    let fs = FuseAdapter::new(Box::new(HelloFs::new()));
+    // Выбор реализации `Filesystem` по аргументам — верхние слои от неё не зависят.
+    let inner: Box<dyn Filesystem> = match &args.image {
+        Some(path) => {
+            let src = match ImageFile::open(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("не открыть образ {}: {e}", path.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            match FatFs::open(src) {
+                Ok(fs) => Box::new(fs),
+                Err(e) => {
+                    eprintln!("не разобрать FAT в {}: {e}", path.display());
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => Box::new(HelloFs::new()),
+    };
 
     let options = vec![
         MountOption::RO,
@@ -33,8 +81,12 @@ fn main() -> ExitCode {
         MountOption::CUSTOM("volname=Floppy".to_string()),
     ];
 
-    println!("Монтирую hello-FS в {mountpoint} (Ctrl-C для размонтирования)…");
-    match fuser::mount2(fs, &mountpoint, &options) {
+    let what = if args.image.is_some() { "образ" } else { "hello-FS" };
+    println!(
+        "Монтирую {what} в {} (Ctrl-C для размонтирования)…",
+        args.mountpoint
+    );
+    match fuser::mount2(FuseAdapter::new(inner), &args.mountpoint, &options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("ошибка монтирования: {e}");
