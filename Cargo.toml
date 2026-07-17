@@ -1,0 +1,11 @@
+[package]
+name = "floppy_mac"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only macOS FUSE driver for mounting physical floppy disks via Greaseweazle"
+
+[dependencies]
+fuser = "0.14"
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
