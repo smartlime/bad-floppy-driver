@@ -8,6 +8,7 @@
 //!     floppy_mac <точка-монтирования> --image f.img   # FAT12/16 из образа
 //!   Размонтировать: umount <точка-монтирования>   (или Ctrl-C)
 
+mod actor;
 mod block_source;
 mod fatfs_fs;
 mod fs;
@@ -64,6 +65,11 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // Источник заворачиваем в актор с дорожечным кэшем. Для .img это
+            // избыточно (файл и так быстрый), но так проверяем ту же схему
+            // конкурентности/кэша, что понадобится Визелю на шаге 3.
+            // spt=18 — гранула кэша (стандарт 1.44МБ); на шаге 3 уточнится из BPB.
+            let src = actor::spawn(src, 18);
             match FatFs::open(src) {
                 Ok(fs) => Box::new(fs),
                 Err(e) => {
