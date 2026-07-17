@@ -14,6 +14,8 @@ mod fatfs_fs;
 mod fs;
 mod fuse_adapter;
 mod image;
+#[allow(dead_code)] // используется с шага 3 (greaseweazle_src)
+mod mfm;
 mod volume_io;
 
 use std::path::PathBuf;
