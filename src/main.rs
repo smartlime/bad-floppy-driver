@@ -13,6 +13,8 @@ mod block_source;
 mod fatfs_fs;
 mod fs;
 mod fuse_adapter;
+#[allow(dead_code)] // управление/чтение — задействуется в greaseweazle_src
+mod gw;
 mod image;
 #[allow(dead_code)] // используется с шага 3 (greaseweazle_src)
 mod mfm;

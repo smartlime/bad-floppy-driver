@@ -321,7 +321,7 @@ mod tests {
         let cells = encode::sector(0, 0, 1, 2, &data);
         let jit = |i: usize| -> i32 {
             let r = ((i as u32).wrapping_mul(2654435761) >> 24) as i32 % 160; // 0..159
-            (r - 80) // ±80 тиков при периоде 1000 => ±8%
+            r - 80 // ±80 тиков при периоде 1000 => ±8%
         };
         let flux = encode::cells_to_flux(&cells, 1000, &jit);
         let secs = decode_track(&flux);
