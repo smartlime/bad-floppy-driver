@@ -137,10 +137,22 @@ impl<B: BlockSource> Filesystem for FatFs<B> {
     }
 
     fn read(&self, ino: u64, offset: u64, size: u32) -> Option<Vec<u8>> {
-        let path = self.path_of(ino)?;
+        let Some(path) = self.path_of(ino) else {
+            log::warn!("read: неизвестный inode {ino}");
+            return None;
+        };
         let root = self.fs.root_dir();
-        let mut file = root.open_file(&path).ok()?;
-        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut file = match root.open_file(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("read: open_file({path}) → {e}");
+                return None;
+            }
+        };
+        if let Err(e) = file.seek(SeekFrom::Start(offset)) {
+            log::warn!("read: seek({offset}) в {path} → {e}");
+            return None;
+        }
 
         let mut buf = vec![0u8; size as usize];
         let mut filled = 0;
@@ -148,7 +160,10 @@ impl<B: BlockSource> Filesystem for FatFs<B> {
             match file.read(&mut buf[filled..]) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
-                Err(_) => return None,
+                Err(e) => {
+                    log::warn!("read: {path} @ off {}: {e}", offset + filled as u64);
+                    return None;
+                }
             }
         }
         buf.truncate(filled);

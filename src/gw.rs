@@ -84,9 +84,23 @@ impl Greaseweazle {
             port,
             sample_freq: 0,
         };
+        gw.reset()?;
         let info = gw.get_info()?;
         gw.sample_freq = info.sample_freq;
         Ok(gw)
+    }
+
+    /// «Clear comms» ресинхронизация (usb.py reset): сброс буферов + переключение
+    /// baudrate на магическое ClearComms и обратно. Приводит прошивку в известное
+    /// состояние и выравнивает поток команд после подключения.
+    fn reset(&mut self) -> io::Result<()> {
+        const CLEAR_COMMS: u32 = 10000;
+        const NORMAL: u32 = 9600;
+        let _ = self.port.clear(serialport::ClearBuffer::Output);
+        let _ = self.port.set_baud_rate(CLEAR_COMMS);
+        let _ = self.port.set_baud_rate(NORMAL);
+        let _ = self.port.clear(serialport::ClearBuffer::Input);
+        Ok(())
     }
 
     pub fn sample_freq(&self) -> u32 {
@@ -115,8 +129,8 @@ impl Greaseweazle {
     }
 
     pub fn get_info(&mut self) -> io::Result<FirmwareInfo> {
-        // [GetInfo, len=4, index=0, 0] затем 32 байта payload.
-        self.send_cmd(&[cmd::GET_INFO, 4, 0, 0])?;
+        // [GetInfo, len=3, index=Firmware(0)] затем 32 байта payload.
+        self.send_cmd(&[cmd::GET_INFO, 3, 0])?;
         let mut buf = [0u8; 32];
         self.port.read_exact(&mut buf)?;
         // Раскладка: major, minor, is_main, max_cmd, sample_freq(u32 LE), …

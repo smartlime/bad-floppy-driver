@@ -42,6 +42,7 @@ struct Args {
     unit: u8,
     revs: u16,
     list_devices: bool,
+    probe: bool,
 }
 
 fn parse_args() -> Option<Args> {
@@ -52,6 +53,7 @@ fn parse_args() -> Option<Args> {
         unit: 0,
         revs: 3,
         list_devices: false,
+        probe: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -61,10 +63,67 @@ fn parse_args() -> Option<Args> {
             "--unit" => a.unit = it.next()?.parse().ok()?,
             "--revs" => a.revs = it.next()?.parse().ok()?,
             "--list-devices" => a.list_devices = true,
+            "--probe" => a.probe = true,
             _ => a.mountpoint = Some(arg),
         }
     }
     Some(a)
+}
+
+/// Диагностика живого чтения без FUSE: прошивка, дорожка 0, секторы, геометрия.
+fn probe(port: &str, unit: u8, revs: u16) -> std::io::Result<()> {
+    use crate::gw::{BusType, Greaseweazle};
+
+    let mut gw = Greaseweazle::open(port)?;
+    let info = gw.get_info()?;
+    println!(
+        "Прошивка: v{}.{}, sample_freq = {} Гц",
+        info.major, info.minor, info.sample_freq
+    );
+
+    gw.set_bus_type(BusType::Ibmpc)?;
+    gw.select(unit)?;
+    gw.set_motor(unit, true)?;
+    std::thread::sleep(std::time::Duration::from_millis(600)); // раскрутка мотора
+
+    for (cyl, head) in [(0u16, 0u8), (0, 1)] {
+        gw.seek(cyl as u8)?;
+        gw.select_head(head)?;
+        let flux = gw.read_flux(revs)?;
+        let mut sorted = flux.clone();
+        sorted.sort_unstable();
+        let (min, med, max) = if sorted.is_empty() {
+            (0, 0, 0)
+        } else {
+            (sorted[0], sorted[sorted.len() / 2], sorted[sorted.len() - 1])
+        };
+        let sectors = crate::mfm::decode_track(&flux);
+        let good = sectors.iter().filter(|s| s.data_crc_ok).count();
+        println!(
+            "\nдорожка C{cyl} H{head}: флукс={} интервалов (тики min/med/max = {min}/{med}/{max}), \
+             секторов декодировано={} (валидных по CRC={})",
+            flux.len(),
+            sectors.len(),
+            good
+        );
+        let mut nums: Vec<u8> = sectors.iter().map(|s| s.sector).collect();
+        nums.sort_unstable();
+        nums.dedup();
+        println!("  номера секторов: {nums:?}");
+        for s in sectors.iter().filter(|s| s.sector == 1) {
+            println!(
+                "  R1: C{} H{} N{} idCRC={} dataCRC={}",
+                s.cyl, s.head, s.size_code, s.id_crc_ok, s.data_crc_ok
+            );
+            if let Some(g) = crate::greaseweazle_src::parse_bpb(&s.data) {
+                println!("  BPB: {g:?}");
+            }
+        }
+    }
+
+    gw.set_motor(unit, false)?;
+    gw.deselect()?;
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -89,6 +148,20 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    if args.probe {
+        let Some(port) = args.device.clone() else {
+            eprintln!("--probe требует --device <port>");
+            return ExitCode::FAILURE;
+        };
+        return match probe(&port, args.unit, args.revs) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("probe: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let Some(mountpoint) = args.mountpoint.clone() else {
