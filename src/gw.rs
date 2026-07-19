@@ -75,10 +75,12 @@ pub struct Greaseweazle {
 fn open_port(path: &str) -> io::Result<Box<dyn SerialPort>> {
     // GW — CDC-устройство; скорость номинальная, важен щедрый таймаут:
     // чтение флукса дорожки длится сотни мс.
-    serialport::new(path, 115_200)
+    log::info!("открываю порт {path}…");
+    let p = serialport::new(path, 115_200)
         .timeout(Duration::from_secs(15))
         .open()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    Ok(p)
 }
 
 impl Greaseweazle {
@@ -89,8 +91,16 @@ impl Greaseweazle {
             path: path.to_string(),
             sample_freq: 0,
         };
+        log::info!("порт {path} открыт, ресинхронизация (reset)…");
         gw.reset()?;
+        log::info!("reset ок, запрашиваю прошивку…");
         let info = gw.get_info()?;
+        log::info!(
+            "прошивка v{}.{}, sample_freq {} Гц",
+            info.major,
+            info.minor,
+            info.sample_freq
+        );
         gw.sample_freq = info.sample_freq;
         Ok(gw)
     }
@@ -205,19 +215,23 @@ impl Greaseweazle {
         c.extend_from_slice(&nr.to_le_bytes());
         self.send_cmd(&c)?;
 
+        log::info!("read_flux: {revs} об., жду поток…");
         let raw = self.read_until_zero()?;
         // Завершаем чтение и проверяем статус потока.
         self.send_cmd(&[cmd::GET_FLUX_STATUS, 2])?;
 
         let (flux, _index) = decode_flux(&raw);
+        log::info!("read_flux: {} байт → {} интервалов", raw.len(), flux.len());
         Ok(flux)
     }
 
     /// Прочитать байты из порта до терминатора 0 включительно (0 в потоке
-    /// флукса встречается только как маркер конца).
+    /// флукса встречается только как маркер конца). Ограничено по времени —
+    /// иначе зависшая прошивка (поток без терминатора) вешала бы навсегда.
     fn read_until_zero(&mut self) -> io::Result<Vec<u8>> {
         let mut out = Vec::with_capacity(64 * 1024);
         let mut chunk = [0u8; 4096];
+        let start = std::time::Instant::now();
         loop {
             let n = self.port.read(&mut chunk)?;
             if n == 0 {
@@ -229,6 +243,15 @@ impl Greaseweazle {
             out.extend_from_slice(&chunk[..n]);
             if out.last() == Some(&0) {
                 break;
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "поток флукса не завершился за 20с ({} байт) — прошивка/привод завис",
+                        out.len()
+                    ),
+                ));
             }
         }
         Ok(out)

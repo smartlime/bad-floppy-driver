@@ -88,10 +88,12 @@ impl GreaseweazleSource {
     /// best-effort: отдаём данные даже с плохим CRC, пропавший сектор → нули,
     /// а список проблемных секторов печатается при размонтировании.
     pub fn open(port: &str, unit: u8, revs: u16, recover: bool) -> io::Result<Self> {
+        log::info!("подключаюсь к Greaseweazle на {port}…");
         let mut gw = Greaseweazle::open(port)?;
         gw.set_bus_type(BusType::Ibmpc)?;
         gw.select(unit)?;
         gw.set_motor(unit, true)?;
+        log::info!("привод {unit} выбран, мотор запущен; читаю дорожку 0 (BPB)…");
 
         // Прочитать дорожку 0 головки 0 и найти boot-сектор (R=1).
         gw.seek(0)?;
@@ -142,12 +144,15 @@ impl GreaseweazleSource {
     ) -> io::Result<()> {
         // Прошивка снимает выбор привода после простоя (иначе seek → NoUnit),
         // поэтому пере-подтверждаем выбор и мотор перед каждым физическим чтением.
+        log::info!("чтение дорожки C{cyl} H{head} ({revs} об.)…");
         self.gw.select(self.unit)?;
         self.gw.set_motor(self.unit, true)?;
         self.gw.seek(cyl as u8)?;
         self.gw.select_head(head)?;
         let flux = self.gw.read_flux(revs)?;
         let sectors = mfm::decode_track(&flux);
+        let good = sectors.iter().filter(|s| s.data_crc_ok).count();
+        log::info!("C{cyl} H{head}: {} секторов, валидных {good}", sectors.len());
 
         if fresh {
             self.cur_sectors.clear();

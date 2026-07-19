@@ -44,6 +44,7 @@ struct Args {
     list_devices: bool,
     probe: bool,
     recover: bool,
+    verbose: bool,
 }
 
 fn parse_args() -> Option<Args> {
@@ -56,6 +57,7 @@ fn parse_args() -> Option<Args> {
         list_devices: false,
         probe: false,
         recover: false,
+        verbose: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -67,6 +69,7 @@ fn parse_args() -> Option<Args> {
             "--list-devices" => a.list_devices = true,
             "--probe" => a.probe = true,
             "--recover" => a.recover = true,
+            "-v" | "--verbose" => a.verbose = true,
             _ => a.mountpoint = Some(arg),
         }
     }
@@ -130,12 +133,17 @@ fn probe(port: &str, unit: u8, revs: u16) -> std::io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    env_logger::init();
-
     let Some(args) = parse_args() else {
-        eprintln!("usage: floppy_mac <mountpoint> [--image <path> | --device <port>]");
+        eprintln!("usage: floppy_mac <mountpoint> [--image <path> | --device <port>] [-v]");
         return ExitCode::FAILURE;
     };
+
+    // -v/--verbose → подробный лог всех этапов в stderr (info). Иначе — RUST_LOG
+    // или тихо (warn). Логи гарантированно flush'атся построчно.
+    let default_level = if args.verbose { "info" } else { "warn" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+        .format_timestamp_millis()
+        .init();
 
     if args.list_devices {
         match gw::enumerate() {
@@ -232,7 +240,7 @@ fn main() -> ExitCode {
         MountOption::CUSTOM("volname=Floppy".to_string()),
     ];
 
-    println!("Монтирую {what} в {mountpoint} (Ctrl-C для размонтирования)…");
+    println!("✔ {what} смонтирован в {mountpoint}. Работаю — Ctrl-C для размонтирования.");
     match fuser::mount2(FuseAdapter::new(inner), &mountpoint, &options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
