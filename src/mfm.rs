@@ -76,6 +76,9 @@ pub fn decode_track(flux_ticks: &[u32]) -> Vec<Sector> {
 fn flux_to_cells(flux_ticks: &[u32]) -> Vec<bool> {
     // Начальная оценка периода ячейки: ~5-й перцентиль интервалов ≈ «2 ячейки».
     let mut sorted: Vec<u32> = flux_ticks.iter().copied().filter(|&t| t > 0).collect();
+    if sorted.is_empty() {
+        return Vec::new(); // мусорный/пустой поток — без паники
+    }
     sorted.sort_unstable();
     let p5 = sorted[sorted.len() / 20];
     let mut cell = (p5 as f64 / 2.0).max(1.0);

@@ -9,7 +9,7 @@
 //! в `spt` физических чтений флукса, здесь держим кэш ПОСЛЕДНЕЙ прочитанной
 //! дорожки: первый сектор дорожки читает флукс, остальные берутся из него.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 
 use crate::block_source::BlockSource;
@@ -75,13 +75,19 @@ pub struct GreaseweazleSource {
     geom: Geometry,
     unit: u8,
     revs: u16,
+    recover: bool,
     cur_track: Option<(u16, u8)>,
     cur_sectors: HashMap<u8, mfm::Sector>, // R → лучший (по CRC) сектор дорожки
+    bad: BTreeSet<(u16, u8, u8)>,          // отчёт: битые/пропавшие секторы (recover)
 }
 
 impl GreaseweazleSource {
     /// Открыть привод, раскрутить мотор, определить геометрию по BPB дорожки 0.
-    pub fn open(port: &str, unit: u8, revs: u16) -> io::Result<Self> {
+    ///
+    /// `recover`: при `false` (по умолчанию) битый сектор → EIO; при `true` —
+    /// best-effort: отдаём данные даже с плохим CRC, пропавший сектор → нули,
+    /// а список проблемных секторов печатается при размонтировании.
+    pub fn open(port: &str, unit: u8, revs: u16, recover: bool) -> io::Result<Self> {
         let mut gw = Greaseweazle::open(port)?;
         gw.set_bus_type(BusType::Ibmpc)?;
         gw.select(unit)?;
@@ -114,8 +120,10 @@ impl GreaseweazleSource {
             geom,
             unit,
             revs,
+            recover,
             cur_track: None,
             cur_sectors: HashMap::new(),
+            bad: BTreeSet::new(),
         })
     }
 
@@ -161,6 +169,23 @@ impl GreaseweazleSource {
     fn have_good(&self, sec: u8) -> bool {
         self.cur_sectors.get(&sec).is_some_and(|s| s.data_crc_ok)
     }
+
+    /// Загрузить дорожку. В recover-режиме ошибка чтения не пробрасывается:
+    /// оставляем пустой кэш (секторы будут отданы нулями), чтобы весь файл дочитался.
+    fn load(&mut self, cyl: u16, head: u8, revs: u16, fresh: bool) -> io::Result<()> {
+        match self.read_track_into_cache(cyl, head, revs, fresh) {
+            Ok(()) => Ok(()),
+            Err(e) if self.recover => {
+                if fresh {
+                    self.cur_sectors.clear();
+                    self.cur_track = Some((cyl, head));
+                }
+                log::warn!("recover: дорожка C{cyl} H{head} не прочиталась ({e})");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl BlockSource for GreaseweazleSource {
@@ -175,7 +200,7 @@ impl BlockSource for GreaseweazleSource {
     fn read_block(&mut self, lba: u64) -> io::Result<Vec<u8>> {
         let (cyl, head, sec) = lba_to_chs(&self.geom, lba);
         if self.cur_track != Some((cyl, head)) {
-            self.read_track_into_cache(cyl, head, self.revs, true)?;
+            self.load(cyl, head, self.revs, true)?;
         }
         // Решение №9: капризный сектор дочитываем бо́льшим числом оборотов,
         // сливая удачные копии, и лишь потом сдаёмся с EIO.
@@ -184,18 +209,38 @@ impl BlockSource for GreaseweazleSource {
             attempt += 1;
             let revs = self.revs + attempt as u16 * 3;
             log::info!("сектор C{cyl} H{head} R{sec}: ретрай {revs} оборотов");
-            self.read_track_into_cache(cyl, head, revs, false)?;
+            self.load(cyl, head, revs, false)?;
         }
+        // Успех: сектор с валидным CRC.
+        if let Some(data) = self
+            .cur_sectors
+            .get(&sec)
+            .filter(|s| s.data_crc_ok)
+            .map(|s| s.data.clone())
+        {
+            return Ok(data);
+        }
+
+        // Решение №9, режим recover: отдаём что есть, помечаем в отчёте.
+        if self.recover {
+            self.bad.insert((cyl, head, sec));
+            if let Some(data) = self.cur_sectors.get(&sec).map(|s| s.data.clone()) {
+                log::warn!("recover: C{cyl} H{head} R{sec} — отдаю данные с плохим CRC");
+                return Ok(data);
+            }
+            log::warn!("recover: C{cyl} H{head} R{sec} отсутствует — заполняю нулями");
+            return Ok(vec![0u8; self.geom.bytes_per_sector as usize]);
+        }
+
+        // По умолчанию — честный отказ.
         match self.cur_sectors.get(&sec) {
-            Some(s) if s.data_crc_ok => Ok(s.data.clone()),
-            // Решение №9: по умолчанию строгий EIO на битом/пропавшем секторе.
             Some(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("сектор C{cyl} H{head} R{sec}: CRC не сошёлся"),
+                format!("сектор C{cyl} H{head} R{sec}: CRC не сошёлся (пробуй --recover)"),
             )),
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("сектор C{cyl} H{head} R{sec} не найден на дорожке"),
+                format!("сектор C{cyl} H{head} R{sec} не найден (пробуй --recover)"),
             )),
         }
     }
@@ -203,6 +248,13 @@ impl BlockSource for GreaseweazleSource {
 
 impl Drop for GreaseweazleSource {
     fn drop(&mut self) {
+        // Отчёт о проблемных секторах (recover-режим).
+        if !self.bad.is_empty() {
+            eprintln!("Проблемных секторов: {} (C/H/R):", self.bad.len());
+            for (c, h, r) in &self.bad {
+                eprintln!("  C{c} H{h} R{r}");
+            }
+        }
         // Погасить мотор и отпустить привод.
         let _ = self.gw.set_motor(self.unit, false);
         let _ = self.gw.deselect();

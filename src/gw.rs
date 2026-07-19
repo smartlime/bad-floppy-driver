@@ -277,9 +277,10 @@ pub fn decode_flux(dat: &[u8]) -> (Vec<u32>, Vec<u32>) {
             ticks_since_index += ticks;
             ticks = 0;
         } else {
-            // среднее значение: 250 + (i-250)*255 + (next-1)
+            // среднее значение: 250 + (i-250)*255 + (next-1).
+            // saturating_sub: на мусорном потоке next может быть 0 (иначе underflow-паника).
             let next = it.next().unwrap_or(1) as u32;
-            let val = 250 + (i as u32 - 250) * 255 + (next - 1);
+            let val = 250 + (i as u32 - 250) * 255 + next.saturating_sub(1);
             ticks += val;
             flux.push(ticks);
             ticks_since_index += ticks;

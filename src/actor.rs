@@ -65,7 +65,15 @@ impl<B: BlockSource> DeviceActor<B> {
         for req in rx {
             match req {
                 Request::ReadBlock { lba, resp } => {
-                    let _ = resp.send(self.cached_read(lba));
+                    // Ловим панику декодера/протокола: одна битая дорожка не должна
+                    // ронять весь актор (иначе весь том отваливается).
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.cached_read(lba)
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(io::Error::new(io::ErrorKind::Other, "паника при чтении блока"))
+                    });
+                    let _ = resp.send(r);
                 }
             }
         }

@@ -43,6 +43,7 @@ struct Args {
     revs: u16,
     list_devices: bool,
     probe: bool,
+    recover: bool,
 }
 
 fn parse_args() -> Option<Args> {
@@ -54,6 +55,7 @@ fn parse_args() -> Option<Args> {
         revs: 3,
         list_devices: false,
         probe: false,
+        recover: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -64,6 +66,7 @@ fn parse_args() -> Option<Args> {
             "--revs" => a.revs = it.next()?.parse().ok()?,
             "--list-devices" => a.list_devices = true,
             "--probe" => a.probe = true,
+            "--recover" => a.recover = true,
             _ => a.mountpoint = Some(arg),
         }
     }
@@ -191,7 +194,7 @@ fn main() -> ExitCode {
             }
         }
         (None, Some(port)) => {
-            let src = match GreaseweazleSource::open(port, args.unit, args.revs) {
+            let src = match GreaseweazleSource::open(port, args.unit, args.revs, args.recover) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Greaseweazle на {port}: {e}");
