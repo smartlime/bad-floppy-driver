@@ -10,7 +10,7 @@ use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::sync::Mutex;
 
 use crate::block_source::BlockSource;
-use crate::fs::{Attr, DirEntry, FileKind, Filesystem};
+use crate::fs::{Attr, DirEntry, FileKind, Filesystem, VolStats};
 use crate::volume_io::VolumeIo;
 
 const ROOT_INO: u64 = 1;
@@ -168,6 +168,15 @@ impl<B: BlockSource> Filesystem for FatFs<B> {
         }
         buf.truncate(filled);
         Some(buf)
+    }
+
+    fn stats(&self) -> Option<VolStats> {
+        let s = self.fs.stats().ok()?;
+        Some(VolStats {
+            total_blocks: s.total_clusters() as u64,
+            free_blocks: s.free_clusters() as u64,
+            block_size: s.cluster_size(),
+        })
     }
 }
 

@@ -123,16 +123,30 @@ impl GreaseweazleSource {
         self.geom
     }
 
-    /// Прочитать и декодировать дорожку в кэш последней дорожки.
-    fn load_track(&mut self, cyl: u16, head: u8) -> io::Result<()> {
+    /// Физически прочитать дорожку за `revs` оборотов и слить удачные (по CRC)
+    /// секторы в кэш текущей дорожки. `fresh` очищает кэш (новая дорожка).
+    fn read_track_into_cache(
+        &mut self,
+        cyl: u16,
+        head: u8,
+        revs: u16,
+        fresh: bool,
+    ) -> io::Result<()> {
+        // Прошивка снимает выбор привода после простоя (иначе seek → NoUnit),
+        // поэтому пере-подтверждаем выбор и мотор перед каждым физическим чтением.
+        self.gw.select(self.unit)?;
+        self.gw.set_motor(self.unit, true)?;
         self.gw.seek(cyl as u8)?;
         self.gw.select_head(head)?;
-        let flux = self.gw.read_flux(self.revs)?;
+        let flux = self.gw.read_flux(revs)?;
         let sectors = mfm::decode_track(&flux);
 
-        self.cur_sectors.clear();
+        if fresh {
+            self.cur_sectors.clear();
+            self.cur_track = Some((cyl, head));
+        }
         for s in sectors {
-            // За несколько оборотов сектор встречается несколько раз — берём валидный по CRC.
+            // Сливаем: сектор с валидным CRC вытесняет отсутствующий/битый.
             let better = match self.cur_sectors.get(&s.sector) {
                 Some(existing) => !existing.data_crc_ok && s.data_crc_ok,
                 None => true,
@@ -141,8 +155,11 @@ impl GreaseweazleSource {
                 self.cur_sectors.insert(s.sector, s);
             }
         }
-        self.cur_track = Some((cyl, head));
         Ok(())
+    }
+
+    fn have_good(&self, sec: u8) -> bool {
+        self.cur_sectors.get(&sec).is_some_and(|s| s.data_crc_ok)
     }
 }
 
@@ -158,7 +175,16 @@ impl BlockSource for GreaseweazleSource {
     fn read_block(&mut self, lba: u64) -> io::Result<Vec<u8>> {
         let (cyl, head, sec) = lba_to_chs(&self.geom, lba);
         if self.cur_track != Some((cyl, head)) {
-            self.load_track(cyl, head)?;
+            self.read_track_into_cache(cyl, head, self.revs, true)?;
+        }
+        // Решение №9: капризный сектор дочитываем бо́льшим числом оборотов,
+        // сливая удачные копии, и лишь потом сдаёмся с EIO.
+        let mut attempt = 0;
+        while !self.have_good(sec) && attempt < 2 {
+            attempt += 1;
+            let revs = self.revs + attempt as u16 * 3;
+            log::info!("сектор C{cyl} H{head} R{sec}: ретрай {revs} оборотов");
+            self.read_track_into_cache(cyl, head, revs, false)?;
         }
         match self.cur_sectors.get(&sec) {
             Some(s) if s.data_crc_ok => Ok(s.data.clone()),

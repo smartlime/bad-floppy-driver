@@ -212,6 +212,17 @@ fn main() -> ExitCode {
         (None, None) => (Box::new(HelloFs::new()), "hello-FS"),
     };
 
+    // Предчтение метаданных (решение 6d): прогреваем кэш дорожек корня
+    // (boot+FAT+корневой каталог), чтобы первый просмотр в Finder был мгновенным.
+    if args.image.is_some() || args.device.is_some() {
+        let t = std::time::Instant::now();
+        let n = inner.readdir(1).map(|v| v.len()).unwrap_or(0);
+        println!(
+            "Предчтение метаданных: корень — {n} записей за {:?}",
+            t.elapsed()
+        );
+    }
+
     let options = vec![
         MountOption::RO,
         MountOption::FSName("floppy_mac".to_string()),

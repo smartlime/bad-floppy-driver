@@ -23,6 +23,13 @@ pub struct DirEntry {
     pub kind: FileKind,
 }
 
+/// Сведения о томе для `statfs` (чтобы Finder показывал ёмкость).
+pub struct VolStats {
+    pub total_blocks: u64,
+    pub free_blocks: u64,
+    pub block_size: u32,
+}
+
 /// Файловая система, представляемая в Finder. Всё read-only (решение №5).
 ///
 /// Без `Send`: `fuser::mount2` работает в одном потоке, а на шаге 3 реализация
@@ -34,6 +41,11 @@ pub trait Filesystem {
     /// Дети каталога `ino` (без "." / "..").
     fn readdir(&self, ino: u64) -> Option<Vec<DirEntry>>;
     fn read(&self, ino: u64, offset: u64, size: u32) -> Option<Vec<u8>>;
+
+    /// Сведения о ёмкости тома (для `statfs`). По умолчанию неизвестны.
+    fn stats(&self) -> Option<VolStats> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

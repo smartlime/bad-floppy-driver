@@ -68,20 +68,25 @@ pub fn enumerate() -> io::Result<Vec<String>> {
 
 pub struct Greaseweazle {
     port: Box<dyn SerialPort>,
+    path: String,
     sample_freq: u32,
+}
+
+fn open_port(path: &str) -> io::Result<Box<dyn SerialPort>> {
+    // GW — CDC-устройство; скорость номинальная, важен щедрый таймаут:
+    // чтение флукса дорожки длится сотни мс.
+    serialport::new(path, 115_200)
+        .timeout(Duration::from_secs(15))
+        .open()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
 }
 
 impl Greaseweazle {
     /// Открыть Визель на указанном порту (например /dev/tty.usbmodemGW…).
     pub fn open(path: &str) -> io::Result<Self> {
-        // GW — CDC-устройство; скорость номинальная, важен щедрый таймаут:
-        // чтение флукса дорожки длится сотни мс.
-        let port = serialport::new(path, 115_200)
-            .timeout(Duration::from_secs(15))
-            .open()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let mut gw = Greaseweazle {
-            port,
+            port: open_port(path)?,
+            path: path.to_string(),
             sample_freq: 0,
         };
         gw.reset()?;
@@ -92,7 +97,11 @@ impl Greaseweazle {
 
     /// «Clear comms» ресинхронизация (usb.py reset): сброс буферов + переключение
     /// baudrate на магическое ClearComms и обратно. Приводит прошивку в известное
-    /// состояние и выравнивает поток команд после подключения.
+    /// состояние и выравнивает поток команд.
+    ///
+    /// ВАЖНО: не пере-открываем порт здесь — `serialport` держит его эксклюзивно
+    /// (TIOCEXCL), и второй `open` того же узла упал бы с EBUSY на самого себя.
+    /// Затем — короткий дренаж остаточных байт (ограничен по времени).
     fn reset(&mut self) -> io::Result<()> {
         const CLEAR_COMMS: u32 = 10000;
         const NORMAL: u32 = 9600;
@@ -100,6 +109,17 @@ impl Greaseweazle {
         let _ = self.port.set_baud_rate(CLEAR_COMMS);
         let _ = self.port.set_baud_rate(NORMAL);
         let _ = self.port.clear(serialport::ClearBuffer::Input);
+
+        // Дренаж остаточных байт (не дольше ~1с), чтобы ack не разъехался.
+        let _ = self.port.set_timeout(Duration::from_millis(150));
+        let mut junk = [0u8; 4096];
+        let start = std::time::Instant::now();
+        while let Ok(n) = self.port.read(&mut junk) {
+            if n == 0 || start.elapsed() > Duration::from_millis(1000) {
+                break;
+            }
+        }
+        let _ = self.port.set_timeout(Duration::from_secs(15));
         Ok(())
     }
 

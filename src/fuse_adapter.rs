@@ -7,7 +7,8 @@ use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request,
+    FileAttr, FileType, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyXattr, Request,
 };
 use libc::{ENOENT, ENOTDIR};
 
@@ -129,5 +130,42 @@ impl fuser::Filesystem for FuseAdapter {
             }
         }
         reply.ok();
+    }
+
+    // --- xattr: у нас их нет, но без корректных ответов cp/fcopyfile и Finder
+    //     спотыкаются (это и вешало копирование). ---
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        reply.error(libc::ENOATTR); // атрибута нет
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, size: u32, reply: ReplyXattr) {
+        // Расширенных атрибутов нет: пустой список.
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
+    fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
+        // Read-only том, доступ на чтение всем разрешаем.
+        reply.ok();
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        let (blocks, bfree, bsize) = match self.inner.stats() {
+            Some(s) => (s.total_blocks, s.free_blocks, s.block_size.max(512)),
+            None => (0, 0, 512),
+        };
+        // blocks, bfree, bavail, files, ffree, bsize, namelen, frsize
+        reply.statfs(blocks, bfree, bfree, 0, 0, bsize, 255, bsize);
     }
 }
