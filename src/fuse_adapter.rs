@@ -4,31 +4,33 @@
 //! (fs, block_source) о macFUSE ничего не знает.
 
 use std::ffi::OsStr;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use fuser::{
-    FileAttr, FileType, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    AccessFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation, INodeNo,
+    LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyStatfs, ReplyXattr, Request,
 };
-use libc::{ENOENT, ENOTDIR};
 
 use crate::fs::{Attr, FileKind, Filesystem};
 
 /// TTL кэша метаданных в ядре. Для read-only тома можно щедро.
 const TTL: Duration = Duration::from_secs(1);
 
+/// `Mutex` делает `FuseAdapter: Sync` даже если внутренняя FS (например, fatfs)
+/// использует `RefCell` и не реализует `Sync` сама по себе.
 pub struct FuseAdapter {
-    inner: Box<dyn Filesystem>,
+    inner: Mutex<Box<dyn Filesystem>>,
     uid: u32,
     gid: u32,
 }
 
 impl FuseAdapter {
     pub fn new(inner: Box<dyn Filesystem>) -> Self {
-        // Владельцем узлов делаем текущего пользователя, чтобы Finder не ругался.
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        FuseAdapter { inner, uid, gid }
+        FuseAdapter { inner: Mutex::new(inner), uid, gid }
     }
 
     fn to_file_attr(&self, a: &Attr) -> FileAttr {
@@ -37,13 +39,13 @@ impl FuseAdapter {
             FileKind::File => (FileType::RegularFile, 0o444, 1),
         };
         FileAttr {
-            ino: a.ino,
+            ino: INodeNo(a.ino),
             size: a.size,
             blocks: (a.size + 511) / 512,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            atime: a.atime,
+            mtime: a.mtime,
+            ctime: a.mtime,
+            crtime: a.crtime,
             kind,
             perm,
             nlink,
@@ -57,63 +59,65 @@ impl FuseAdapter {
 }
 
 impl fuser::Filesystem for FuseAdapter {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let Some(name) = name.to_str() else {
-            reply.error(ENOENT);
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let Some(name_str) = name.to_str() else {
+            reply.error(Errno::ENOENT);
             return;
         };
-        match self.inner.lookup(parent, name) {
-            Some(attr) => reply.entry(&TTL, &self.to_file_attr(&attr), 0),
-            None => reply.error(ENOENT),
+        let inner = self.inner.lock().unwrap();
+        match inner.lookup(parent.0, name_str) {
+            Some(attr) => reply.entry(&TTL, &self.to_file_attr(&attr), Generation(0)),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        match self.inner.getattr(ino) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let inner = self.inner.lock().unwrap();
+        match inner.getattr(ino.0) {
             Some(attr) => reply.attr(&TTL, &self.to_file_attr(&attr)),
-            None => reply.error(ENOENT),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        // Read-only: разрешаем открытие, флагов handle не держим.
-        reply.opened(0, 0);
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.inner.read(ino, offset.max(0) as u64, size) {
+        let inner = self.inner.lock().unwrap();
+        match inner.read(ino.0, offset, size) {
             Some(bytes) => reply.data(&bytes),
-            None => reply.error(ENOENT),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let Some(children) = self.inner.readdir(ino) else {
-            reply.error(ENOTDIR);
+        let inner = self.inner.lock().unwrap();
+        let Some(children) = inner.readdir(ino.0) else {
+            reply.error(Errno::ENOTDIR);
             return;
         };
 
-        // "." и ".." добавляем сами; parent для корня = корень.
         let mut entries: Vec<(u64, FileType, String)> = vec![
-            (ino, FileType::Directory, ".".to_string()),
-            (ino, FileType::Directory, "..".to_string()),
+            (ino.0, FileType::Directory, ".".to_string()),
+            (ino.0, FileType::Directory, "..".to_string()),
         ];
         for e in children {
             let kind = match e.kind {
@@ -122,32 +126,28 @@ impl fuser::Filesystem for FuseAdapter {
             };
             entries.push((e.ino, kind, e.name));
         }
+        drop(inner); // освобождаем мьютекс перед итерацией буфера
 
-        for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            // reply.add вернёт true, когда буфер ядра заполнен.
-            if reply.add(ino, (i + 1) as i64, kind, name) {
+        for (i, (entry_ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
+            if reply.add(INodeNo(entry_ino), (i + 1) as u64, kind, name) {
                 break;
             }
         }
         reply.ok();
     }
 
-    // --- xattr: у нас их нет, но без корректных ответов cp/fcopyfile и Finder
-    //     спотыкаются (это и вешало копирование). ---
-
     fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
         _name: &OsStr,
         _size: u32,
         reply: ReplyXattr,
     ) {
-        reply.error(libc::ENOATTR); // атрибута нет
+        reply.error(Errno::ENOATTR);
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, size: u32, reply: ReplyXattr) {
-        // Расширенных атрибутов нет: пустой список.
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
         if size == 0 {
             reply.size(0);
         } else {
@@ -155,17 +155,16 @@ impl fuser::Filesystem for FuseAdapter {
         }
     }
 
-    fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
-        // Read-only том, доступ на чтение всем разрешаем.
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
         reply.ok();
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        let (blocks, bfree, bsize) = match self.inner.stats() {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let inner = self.inner.lock().unwrap();
+        let (blocks, bfree, bsize) = match inner.stats() {
             Some(s) => (s.total_blocks, s.free_blocks, s.block_size.max(512)),
             None => (0, 0, 512),
         };
-        // blocks, bfree, bavail, files, ffree, bsize, namelen, frsize
         reply.statfs(blocks, bfree, bfree, 0, 0, bsize, 255, bsize);
     }
 }

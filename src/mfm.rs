@@ -66,10 +66,18 @@ impl Sector {
 /// без внешних подсказок.
 pub fn decode_track(flux_ticks: &[u32]) -> Vec<Sector> {
     if flux_ticks.len() < 16 {
+        log::debug!("mfm: слишком мало интервалов флукса ({}), возврат пусто", flux_ticks.len());
         return Vec::new();
     }
     let cells = flux_to_cells(flux_ticks);
-    decode_cells(&cells)
+    log::debug!("mfm: {} интервалов → {} ячеек", flux_ticks.len(), cells.len());
+    let sectors = decode_cells(&cells);
+    log::debug!(
+        "mfm: декодировано {} секторов (валидных по CRC: {})",
+        sectors.len(),
+        sectors.iter().filter(|s| s.data_crc_ok).count()
+    );
+    sectors
 }
 
 /// Флукс-интервалы → битовые ячейки (true = перемагничивание) через PLL.
@@ -82,6 +90,12 @@ fn flux_to_cells(flux_ticks: &[u32]) -> Vec<bool> {
     sorted.sort_unstable();
     let p5 = sorted[sorted.len() / 20];
     let mut cell = (p5 as f64 / 2.0).max(1.0);
+    log::debug!(
+        "PLL: начальный период ячейки {:.1} тик (p5={p5}, min={}, max={})",
+        cell,
+        sorted[0],
+        sorted[sorted.len() - 1]
+    );
 
     let mut cells = Vec::with_capacity(flux_ticks.len() * 3);
     for &t in flux_ticks {
@@ -171,6 +185,7 @@ fn decode_cells(cells: &[bool]) -> Vec<Sector> {
         match mark {
             IDAM => {
                 let Some(body) = read_bytes(cells, mark_pos + 16, 6) else {
+                    log::debug!("IDAM @{start}: не хватает данных, пропуск");
                     continue;
                 };
                 let (c, h, r, n) = (body[0], body[1], body[2], body[3]);
@@ -179,12 +194,18 @@ fn decode_cells(cells: &[bool]) -> Vec<Sector> {
                 crc_in.push(mark);
                 crc_in.extend_from_slice(&body[..4]);
                 let ok = crc16(0xFFFF, &crc_in) == stored;
+                log::debug!(
+                    "IDAM @{start}: C={c} H={h} R={r} N={n} ({}B) id_crc={}",
+                    128usize << n,
+                    if ok { "ok" } else { "BAD" }
+                );
                 pending_id = Some((c, h, r, n, ok));
             }
             DAM | DAM_DELETED => {
                 let (c, h, r, n, id_ok) = pending_id.take().unwrap_or((0, 0, 0, 2, false));
                 let size = 128usize << n;
                 let Some(payload) = read_bytes(cells, mark_pos + 16, size + 2) else {
+                    log::debug!("DAM @{start}: C={c} H={h} R={r} — не хватает данных ({size}B), пропуск");
                     continue;
                 };
                 let data = payload[..size].to_vec();
@@ -193,6 +214,12 @@ fn decode_cells(cells: &[bool]) -> Vec<Sector> {
                 crc_in.push(mark);
                 crc_in.extend_from_slice(&data);
                 let data_ok = crc16(0xFFFF, &crc_in) == stored;
+                log::debug!(
+                    "DAM  @{start}: C={c} H={h} R={r} {size}B id_crc={} data_crc={}{}",
+                    if id_ok { "ok" } else { "BAD" },
+                    if data_ok { "ok" } else { "BAD" },
+                    if mark == DAM_DELETED { " DELETED" } else { "" }
+                );
                 sectors.push(Sector {
                     cyl: c,
                     head: h,

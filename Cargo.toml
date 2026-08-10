@@ -3,9 +3,13 @@ name = "floppy_mac"
 version = "0.1.0"
 edition = "2021"
 description = "Read-only macOS FUSE driver for mounting physical floppy disks via Greaseweazle"
+homepage = "https://github.com/smartlime/mac-floppy-driver"
+repository = "https://github.com/smartlime/mac-floppy-driver"
+license = "GPL-2.0-or-later"
+authors = ["Evgeny Varnakov <e@varnakov.ru>"]
 
 [dependencies]
-fuser = "0.14"
+fuser = "0.18"
 libc = "0.2"
 log = "0.4"
 env_logger = "0.11"

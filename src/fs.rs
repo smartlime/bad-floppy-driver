@@ -3,6 +3,8 @@
 //! FUSE-адаптер общается ТОЛЬКО с этим трейтом. На шаге 2 его реализует
 //! обёртка над крейтом `fatfs`; сейчас — `HelloFs` с синтетическим содержимым.
 
+use std::time::SystemTime;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Dir,
@@ -10,10 +12,21 @@ pub enum FileKind {
 }
 
 /// Атрибуты одного узла (файла/каталога).
+///
+/// Времена берём из FAT (там они в *локальном* времени без TZ). Реализация
+/// `Filesystem` отдаёт уже готовый `SystemTime` в UTC — перевод локального
+/// стенного времени дискеты в epoch делает она сама. Если время неизвестно
+/// (корень, синтетические узлы) — `UNIX_EPOCH`.
 pub struct Attr {
     pub ino: u64,
     pub size: u64,
     pub kind: FileKind,
+    /// Время модификации (FAT write time).
+    pub mtime: SystemTime,
+    /// Время создания (FAT create time).
+    pub crtime: SystemTime,
+    /// Время доступа (FAT access date, без времени суток).
+    pub atime: SystemTime,
 }
 
 /// Одна запись каталога (без "." и ".." — их добавляет адаптер).
@@ -30,12 +43,8 @@ pub struct VolStats {
     pub block_size: u32,
 }
 
-/// Файловая система, представляемая в Finder. Всё read-only (решение №5).
-///
-/// Без `Send`: `fuser::mount2` работает в одном потоке, а на шаге 3 реализация
-/// (fatfs держит `&'static dyn TimeProvider`, не `Sync`) будет жить целиком
-/// внутри потока-актора и границу потоков не пересекать.
-pub trait Filesystem {
+/// Файловая система, представляемая в Finder. Всё read-only.
+pub trait Filesystem: Send {
     fn getattr(&self, ino: u64) -> Option<Attr>;
     fn lookup(&self, parent: u64, name: &str) -> Option<Attr>;
     /// Дети каталога `ino` (без "." / "..").
@@ -82,11 +91,17 @@ impl Filesystem for HelloFs {
                 ino: ROOT_INO,
                 size: 0,
                 kind: FileKind::Dir,
+                mtime: SystemTime::UNIX_EPOCH,
+                crtime: SystemTime::UNIX_EPOCH,
+                atime: SystemTime::UNIX_EPOCH,
             }),
             README_INO => Some(Attr {
                 ino: README_INO,
                 size: README_BODY.len() as u64,
                 kind: FileKind::File,
+                mtime: SystemTime::UNIX_EPOCH,
+                crtime: SystemTime::UNIX_EPOCH,
+                atime: SystemTime::UNIX_EPOCH,
             }),
             _ => None,
         }

@@ -9,7 +9,7 @@
 //!     floppy_mac <точка> --image f.img        # FAT12/16 из образа
 //!     floppy_mac <точка> --device <порт>      # живая дискета
 //!     floppy_mac --list-devices               # список последовательных портов
-//!   Размонтировать: umount <точка>   (или Ctrl-C)
+//!   Размонтировать: umount <точка>   (или Ctrl+c)
 
 mod actor;
 mod block_source;
@@ -20,31 +20,50 @@ mod fuse_adapter;
 mod gw;
 mod greaseweazle_src;
 mod image;
+#[cfg(target_os = "macos")]
+mod mac_mount;
 #[allow(dead_code)] // encode-часть нужна только тестам
 mod mfm;
+mod trdos_fs;
 mod volume_io;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use fuser::MountOption;
+use fuser::{Config, MountOption};
 
 use crate::fatfs_fs::FatFs;
 use crate::fs::{Filesystem, HelloFs};
 use crate::fuse_adapter::FuseAdapter;
-use crate::greaseweazle_src::GreaseweazleSource;
+use crate::greaseweazle_src::{DiskKind, GreaseweazleSource};
 use crate::image::ImageFile;
+use crate::trdos_fs::TrDosFs;
+
+use crate::gw::BusType;
 
 struct Args {
     mountpoint: Option<String>,
     image: Option<PathBuf>,
     device: Option<String>,
     unit: u8,
+    bus: BusType,
+    hd: bool,
     revs: u16,
     list_devices: bool,
     probe: bool,
     recover: bool,
     verbose: bool,
+    help: bool,
+}
+
+/// Разобрать номер привода и определить тип шины по его виду:
+///   "A"/"a" → (0, Ibmpc), "B"/"b" → (1, Ibmpc), цифры → (n, Shugart).
+fn parse_unit(s: &str) -> Option<(u8, BusType)> {
+    match s {
+        "A" | "a" => Some((0, BusType::Ibmpc)),
+        "B" | "b" => Some((1, BusType::Ibmpc)),
+        _ => s.parse::<u8>().ok().map(|n| (n, BusType::Shugart)),
+    }
 }
 
 fn parse_args() -> Option<Args> {
@@ -53,32 +72,79 @@ fn parse_args() -> Option<Args> {
         image: None,
         device: None,
         unit: 0,
+        bus: BusType::Shugart, // GW F1 Plus работает по Shugart (для цифровых приводов 0-3)
+        hd: false,
         revs: 3,
         list_devices: false,
         probe: false,
         recover: false,
         verbose: false,
+        help: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--image" => a.image = Some(PathBuf::from(it.next()?)),
             "--device" => a.device = Some(it.next()?),
-            "--unit" => a.unit = it.next()?.parse().ok()?,
+            "--unit" => {
+                let (unit, bus) = parse_unit(&it.next()?)?;
+                a.unit = unit;
+                a.bus = bus;
+            }
+            "--hd" => a.hd = true,
             "--revs" => a.revs = it.next()?.parse().ok()?,
             "--list-devices" => a.list_devices = true,
             "--probe" => a.probe = true,
             "--recover" => a.recover = true,
             "-v" | "--verbose" => a.verbose = true,
+            "-h" | "--help" | "-?" => a.help = true,
             _ => a.mountpoint = Some(arg),
         }
     }
     Some(a)
 }
 
+fn print_help() {
+    let lines = [
+        "floppy_mac — read-only macOS FUSE-драйвер дискет через Greaseweazle",
+        "",
+        "ИСПОЛЬЗОВАНИЕ:",
+        "  floppy_mac <точка> [--device <порт> | --image <файл>] [опции]",
+        "  floppy_mac --list-devices",
+        "  floppy_mac --probe --device <порт> [опции]",
+        "",
+        "ОПЦИИ:",
+        "  -h, --help, -?     Показать эту справку",
+        "  --device <порт>    Живая дискета через Greaseweazle (serial port)",
+        "  --image <файл>     Смонтировать образ .img",
+        "  --list-devices     Показать доступные serial-порты и выйти",
+        "  --probe            Диагностика без монтирования (нужен --device)",
+        "  --recover          Читать bitrot-дискеты: битые сектора -> нули, отчёт в конце",
+        "  --unit <n>         Привод: 0-3 (Shugart/GW F1 Plus) или A/B (IBM PC шина);",
+        "                     A/B=0/1 по умолчанию; тип шины определяется автоматически",
+        "  --hd               HD-режим: assert density-select (Shugart пин 2 low)",
+        "                     Нужен для 5.25\" HD приводов (Mitsumi, Teac FD-55GFR и др.)",
+        "  --revs <n>         Оборотов на дорожку (по умолчанию 3; больше = надёжнее)",
+        "  -v, --verbose      Debug-лог: команды GW, PLL, секторы, BPB",
+        "",
+        "РАЗМОНТИРОВАТЬ:",
+        "  umount <точка>  (или Ctrl+C)",
+        "",
+        "ПРИМЕРЫ:",
+        "  floppy_mac /tmp/fd --device /dev/tty.usbmodemGW1 -v",
+        "  floppy_mac /tmp/fd --device /dev/tty.usbmodemGW1 --unit 1 --hd -v",
+        "  floppy_mac /tmp/fd --device /dev/tty.usbmodemGW1 --unit A",
+        "  floppy_mac --probe --device /dev/tty.usbmodemGW1 --unit 0 --hd -v",
+        "  floppy_mac /tmp/fd --image disk.img",
+    ];
+    for line in lines {
+        println!("{line}");
+    }
+}
+
 /// Диагностика живого чтения без FUSE: прошивка, дорожка 0, секторы, геометрия.
-fn probe(port: &str, unit: u8, revs: u16) -> std::io::Result<()> {
-    use crate::gw::{BusType, Greaseweazle};
+fn probe(port: &str, unit: u8, bus: BusType, hd: bool, revs: u16) -> std::io::Result<()> {
+    use crate::gw::Greaseweazle;
 
     let mut gw = Greaseweazle::open(port)?;
     let info = gw.get_info()?;
@@ -87,10 +153,18 @@ fn probe(port: &str, unit: u8, revs: u16) -> std::io::Result<()> {
         info.major, info.minor, info.sample_freq
     );
 
-    gw.set_bus_type(BusType::Ibmpc)?;
+    gw.set_bus_type(bus)?;
     gw.select(unit)?;
     gw.set_motor(unit, true)?;
-    std::thread::sleep(std::time::Duration::from_millis(600)); // раскрутка мотора
+    if hd {
+        if let Err(e) = gw.set_pin(2, false) {
+            println!("  set_pin(2, false) не поддерживается: {e}");
+        } else {
+            println!("  density-select: пин 2 = low (HD)");
+        }
+    }
+    println!("  раскрутка мотора (800 мс)…");
+    std::thread::sleep(std::time::Duration::from_millis(800)); // раскрутка мотора
 
     for (cyl, head) in [(0u16, 0u8), (0, 1)] {
         gw.seek(cyl as u8)?;
@@ -140,7 +214,12 @@ fn main() -> ExitCode {
 
     // -v/--verbose → подробный лог всех этапов в stderr (info). Иначе — RUST_LOG
     // или тихо (warn). Логи гарантированно flush'атся построчно.
-    let default_level = if args.verbose { "info" } else { "warn" };
+    if args.help {
+        print_help();
+        return ExitCode::SUCCESS;
+    }
+
+    let default_level = if args.verbose { "debug" } else { "warn" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
         .format_timestamp_millis()
         .init();
@@ -166,7 +245,7 @@ fn main() -> ExitCode {
             eprintln!("--probe требует --device <port>");
             return ExitCode::FAILURE;
         };
-        return match probe(&port, args.unit, args.revs) {
+        return match probe(&port, args.unit, args.bus, args.hd, args.revs) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("probe: {e}");
@@ -181,6 +260,9 @@ fn main() -> ExitCode {
     };
 
     // Выбор реализации `Filesystem` по аргументам — верхние слои от неё не зависят.
+    // Ручка актора нужна, чтобы взвести слежение за извлечением и дождаться Drop
+    // источника (гашение мотора) при выходе; для hello-FS актора нет.
+    let mut actor_handle: Option<actor::ActorHandle> = None;
     let (inner, what): (Box<dyn Filesystem>, &str) = match (&args.image, &args.device) {
         (Some(path), _) => {
             let src = match ImageFile::open(path) {
@@ -192,7 +274,8 @@ fn main() -> ExitCode {
             };
             // Тот же путь конкурентности/кэша, что и для Визеля. spt=18 — гранула
             // кэша для 1.44МБ (для образа неважно для корректности).
-            let src = actor::spawn(src, 18);
+            let (src, h) = actor::spawn(src, 18);
+            actor_handle = Some(h);
             match FatFs::open(src) {
                 Ok(fs) => (Box::new(fs), "образ"),
                 Err(e) => {
@@ -202,22 +285,33 @@ fn main() -> ExitCode {
             }
         }
         (None, Some(port)) => {
-            let src = match GreaseweazleSource::open(port, args.unit, args.revs, args.recover) {
+            let src = match GreaseweazleSource::open(port, args.unit, args.bus, args.hd, args.revs, args.recover) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Greaseweazle на {port}: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            // Гранулу кэша берём равной физическим секторам на дорожку из BPB.
-            let spt = src.geometry().sectors_per_track as u64;
-            let src = actor::spawn(src, spt);
-            match FatFs::open(src) {
-                Ok(fs) => (Box::new(fs), "дискета"),
-                Err(e) => {
-                    eprintln!("не разобрать FAT с дискеты: {e}");
-                    return ExitCode::FAILURE;
-                }
+            let geom = src.geom;
+            let disk_kind = src.disk_kind;
+            let spt = geom.sectors_per_track as u64;
+            let (src, h) = actor::spawn(src, spt);
+            actor_handle = Some(h);
+            match disk_kind {
+                DiskKind::Fat => match FatFs::open(src) {
+                    Ok(fs) => (Box::new(fs) as Box<dyn Filesystem>, "дискета FAT"),
+                    Err(e) => {
+                        eprintln!("не разобрать FAT с дискеты: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                DiskKind::TrDos => match TrDosFs::open(src, geom) {
+                    Ok(fs) => (Box::new(fs) as Box<dyn Filesystem>, "дискета TR-DOS"),
+                    Err(e) => {
+                        eprintln!("не разобрать TR-DOS с дискеты: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
             }
         }
         (None, None) => (Box::new(HelloFs::new()), "hello-FS"),
@@ -234,14 +328,89 @@ fn main() -> ExitCode {
         );
     }
 
-    let options = vec![
+    let mount_options = vec![
         MountOption::RO,
         MountOption::FSName("floppy_mac".to_string()),
         MountOption::CUSTOM("volname=Floppy".to_string()),
+        MountOption::CUSTOM("local".to_string()),
+        MountOption::CUSTOM("noappledouble".to_string()),
     ];
 
-    println!("✔ {what} смонтирован в {mountpoint}. Работаю — Ctrl-C для размонтирования.");
-    match fuser::mount2(FuseAdapter::new(inner), &mountpoint, &options) {
+    #[cfg(target_os = "macos")]
+    let (session, mount_handle) = {
+        let opt_strings: Vec<String> = mount_options
+            .iter()
+            .map(mac_mount::option_str)
+            .collect();
+
+        let (fd, mh) = match mac_mount::mount(&mountpoint, &opt_strings) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("ошибка монтирования: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let mut cfg = Config::default();
+        cfg.mount_options = mount_options;
+
+        let session = match fuser::Session::from_fd(
+            FuseAdapter::new(inner),
+            fd,
+            fuser::SessionACL::Owner,
+            cfg,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ошибка создания FUSE-сессии: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        (session, mh)
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let session = {
+        let mut cfg = Config::default();
+        cfg.mount_options = mount_options;
+        match fuser::Session::new(FuseAdapter::new(inner), Path::new(&mountpoint), &cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ошибка монтирования: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    println!("✔ Смонтировано: {what} в {mountpoint}. Работаю — Ctrl+c для размонтирования.");
+
+    // Слежение за физическим извлечением носителя — только для живого привода.
+    #[cfg(target_os = "macos")]
+    if args.device.is_some() {
+        if let Some(h) = &actor_handle {
+            // MountHandle нужно передать в замыкание; оборачиваем в Arc чтобы
+            // Sync+Send + Drop отработал в любом потоке.
+            let mh = std::sync::Arc::new(mount_handle);
+            let mp = mountpoint.clone();
+            h.watch_eject(
+                Box::new(move || {
+                    mh.umount();
+                    // После umount() macFUSE пробудит Session::run(), которая завершится сама.
+                    // Доп. umount через umount(1) не нужен — macFUSE делает это внутри.
+                    drop(mp); // зафиксировать захват переменной
+                }),
+                mountpoint.clone(),
+            );
+        }
+    }
+
+    // run() потребляет Session; после возврата FS уже дропнута → клиент актора
+    // закрыт → актор завершается → Drop источника гасит мотор.
+    let run = session.run();
+    if let Some(h) = actor_handle {
+        h.join();
+    }
+    match run {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("ошибка монтирования: {e}");

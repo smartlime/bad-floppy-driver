@@ -23,6 +23,11 @@ enum Request {
         lba: u64,
         resp: Sender<io::Result<Vec<u8>>>,
     },
+    /// Взвести слежение за физическим извлечением носителя.
+    WatchEject {
+        on_eject: Box<dyn FnOnce() + Send + 'static>,
+        mountpoint: String,
+    },
 }
 
 /// Клиент актора: реализует `BlockSource`, но каждый вызов уходит в поток-актор.
@@ -57,6 +62,7 @@ struct DeviceActor<B: BlockSource> {
     block_count: u64,
     /// track index -> все секторы дорожки.
     cache: HashMap<u64, Vec<Vec<u8>>>,
+    eject_watch: Option<(Box<dyn FnOnce() + Send + 'static>, String)>,
 }
 
 impl<B: BlockSource> DeviceActor<B> {
@@ -73,9 +79,28 @@ impl<B: BlockSource> DeviceActor<B> {
                     .unwrap_or_else(|_| {
                         Err(io::Error::new(io::ErrorKind::Other, "паника при чтении блока"))
                     });
+                    self.check_eject(&r);
                     let _ = resp.send(r);
                 }
+                Request::WatchEject { on_eject, mountpoint } => {
+                    self.eject_watch = Some((on_eject, mountpoint));
+                }
             }
+        }
+    }
+
+    /// Реактивное определение извлечения: привод без дискеты не даёт индекс-импульсов,
+    /// и чтение возвращает `NotConnected` (NO_INDEX). DSKCHG на этом железе нечитаем,
+    /// поэтому ловим извлечение по этому признаку при ближайшем чтении. При срабатывании —
+    /// сообщение и размонтирование (том исчезает, `Session::run` в `main` завершается).
+    fn check_eject(&mut self, r: &io::Result<Vec<u8>>) {
+        let ejected = matches!(r, Err(e) if e.kind() == io::ErrorKind::NotConnected);
+        if !ejected {
+            return;
+        }
+        if let Some((on_eject, mountpoint)) = self.eject_watch.take() {
+            println!("Дискета извлечена — размонтирую {mountpoint} и выхожу.");
+            on_eject();
         }
     }
 
@@ -108,16 +133,38 @@ impl<B: BlockSource> DeviceActor<B> {
     }
 }
 
-/// Запустить актор над источником и вернуть клиент-`BlockSource`.
+/// Ручка управления актором со стороны `main`: взводит слежение за извлечением
+/// носителя и позволяет дождаться завершения потока (чтобы `Drop` источника —
+/// гашение мотора — успел отработать до выхода процесса).
+pub struct ActorHandle {
+    arm_tx: Sender<Request>,
+    join: thread::JoinHandle<()>,
+}
+
+impl ActorHandle {
+    /// Взвести слежение за физическим извлечением носителя.
+    pub fn watch_eject(&self, on_eject: Box<dyn FnOnce() + Send + 'static>, mountpoint: String) {
+        let _ = self.arm_tx.send(Request::WatchEject { on_eject, mountpoint });
+    }
+
+    /// Дождаться завершения актора. Сначала дропаем свой `Sender`, иначе актор
+    /// никогда не отсоединится (останется живой отправитель) и join зависнет.
+    pub fn join(self) {
+        drop(self.arm_tx);
+        let _ = self.join.join();
+    }
+}
+
+/// Запустить актор над источником и вернуть клиент-`BlockSource` и ручку.
 ///
 /// `spt` — число секторов на дорожку (гранула кэша). Для PC-дискет — 18 (1.44МБ)
 /// или 9 (720КБ); на шаге 3 уточнится из BPB для совпадения с физдорожками.
-pub fn spawn<B: BlockSource + 'static>(inner: B, spt: u64) -> BlockSourceClient {
+pub fn spawn<B: BlockSource + 'static>(inner: B, spt: u64) -> (BlockSourceClient, ActorHandle) {
     let block_size = inner.block_size();
     let block_count = inner.block_count();
     let (req_tx, rx) = mpsc::channel::<Request>();
 
-    thread::Builder::new()
+    let join = thread::Builder::new()
         .name("floppy-device-actor".into())
         .spawn(move || {
             let actor = DeviceActor {
@@ -126,16 +173,19 @@ pub fn spawn<B: BlockSource + 'static>(inner: B, spt: u64) -> BlockSourceClient 
                 block_size,
                 block_count,
                 cache: HashMap::new(),
+                eject_watch: None,
             };
             actor.run(rx);
         })
         .expect("spawn device actor thread");
 
-    BlockSourceClient {
-        req_tx,
+    let client = BlockSourceClient {
+        req_tx: req_tx.clone(),
         block_size,
         block_count,
-    }
+    };
+    let handle = ActorHandle { arm_tx: req_tx, join };
+    (client, handle)
 }
 
 fn broken(msg: &str) -> io::Error {
@@ -179,7 +229,7 @@ mod tests {
             block_count: 36, // две дорожки по 18
             reads: reads.clone(),
         };
-        let mut client = spawn(src, 18);
+        let (mut client, _h) = spawn(src, 18);
 
         // Промах по дорожке 0 → ровно 18 физических чтений.
         let s0 = client.read_block(0).unwrap();
@@ -205,7 +255,7 @@ mod tests {
             block_count: 10, // дорожка 0 частично за концом носителя
             reads: reads.clone(),
         };
-        let mut client = spawn(src, 18);
+        let (mut client, _h) = spawn(src, 18);
         let s10 = client.read_block(10).unwrap(); // за концом
         assert_eq!(s10, vec![0u8; 512]);
         // прочитаны только реально существующие секторы 0..10

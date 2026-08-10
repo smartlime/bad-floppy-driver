@@ -27,6 +27,7 @@ mod cmd {
     pub const SELECT: u8 = 12;
     pub const DESELECT: u8 = 13;
     pub const SET_BUS_TYPE: u8 = 14;
+    pub const SET_PIN: u8 = 15;
     pub const GET_PIN: u8 = 20;
 }
 
@@ -34,6 +35,12 @@ mod cmd {
 mod fluxop {
     pub const INDEX: u8 = 1;
     pub const SPACE: u8 = 2;
+}
+
+// --- коды ответа прошивки (usb.py Ack) ---
+mod ack {
+    /// Мотор крутился, но ни одного индекс-импульса — в приводе нет дискеты.
+    pub const NO_INDEX: u8 = 2;
 }
 
 /// Тип шины (usb.py BusType).
@@ -140,9 +147,11 @@ impl Greaseweazle {
     // --- нижний уровень: отправка команды и проверка ответа ---
 
     fn send_cmd(&mut self, cmd: &[u8]) -> io::Result<()> {
+        log::debug!("GW → cmd={} len={} params={:?}", cmd[0], cmd[1], &cmd[2..]);
         self.port.write_all(cmd)?;
         let mut ack = [0u8; 2];
         self.port.read_exact(&mut ack)?;
+        log::debug!("GW ← ack={} result={}", ack[0], ack[1]);
         if ack[0] != cmd[0] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -205,6 +214,31 @@ impl Greaseweazle {
         Ok(b[0] != 0)
     }
 
+    /// Запросить итоговый статус завершённого чтения флукса. `NoIndex` → `NotConnected`
+    /// (в приводе нет дискеты), прочие ненулевые коды → generic-ошибка.
+    fn flux_status(&mut self) -> io::Result<()> {
+        self.port.write_all(&[cmd::GET_FLUX_STATUS, 2])?;
+        let mut a = [0u8; 2];
+        self.port.read_exact(&mut a)?;
+        if a[0] != cmd::GET_FLUX_STATUS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("эхо команды {} != {}", a[0], cmd::GET_FLUX_STATUS),
+            ));
+        }
+        match a[1] {
+            0 => Ok(()),
+            ack::NO_INDEX => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "нет индекс-импульсов — дискета извлечена?",
+            )),
+            other => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("статус флукса → ошибка {other}"),
+            )),
+        }
+    }
+
     /// Прочитать флукс текущей дорожки за `revs` оборотов. Мотор должен крутиться.
     /// Возвращает интервалы перемагничиваний в тиках (индекс-импульсы отброшены).
     pub fn read_flux(&mut self, revs: u16) -> io::Result<Vec<u32>> {
@@ -215,14 +249,28 @@ impl Greaseweazle {
         c.extend_from_slice(&nr.to_le_bytes());
         self.send_cmd(&c)?;
 
-        log::info!("read_flux: {revs} об., жду поток…");
+        log::debug!("read_flux: {revs} об., жду поток…");
         let raw = self.read_until_zero()?;
-        // Завершаем чтение и проверяем статус потока.
-        self.send_cmd(&[cmd::GET_FLUX_STATUS, 2])?;
+        // Завершаем чтение и проверяем статус потока. NO_INDEX = мотор крутился, но
+        // индекс-импульсов нет → в приводе нет дискеты; отдаём отдельным
+        // `NotConnected`, чтобы вышестоящий слой распознал извлечение.
+        self.flux_status()?;
 
         let (flux, _index) = decode_flux(&raw);
-        log::info!("read_flux: {} байт → {} интервалов", raw.len(), flux.len());
+        log::debug!(
+            "read_flux: {} wire-байт → {} интервалов (sample_freq={})",
+            raw.len(),
+            flux.len(),
+            self.sample_freq
+        );
         Ok(flux)
+    }
+
+    /// Установить уровень пина (firmware ≥ v1.1). Используется, например, для
+    /// сигнала density-select (пин 2 Shugart): low=HD, high=DD.
+    pub fn set_pin(&mut self, pin: u8, level: bool) -> io::Result<()> {
+        log::debug!("set_pin: pin={pin} level={level}");
+        self.send_cmd(&[cmd::SET_PIN, 4, pin, level as u8])
     }
 
     /// Прочитать байты из порта до терминатора 0 включительно (0 в потоке
