@@ -27,13 +27,13 @@ mod mfm;
 mod trdos_fs;
 mod volume_io;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use fuser::{Config, MountOption};
 
 use crate::fatfs_fs::FatFs;
-use crate::fs::{Filesystem, HelloFs};
+use crate::fs::{FileKind, Filesystem, HelloFs};
 use crate::fuse_adapter::FuseAdapter;
 use crate::greaseweazle_src::{DiskKind, GreaseweazleSource};
 use crate::image::ImageFile;
@@ -49,9 +49,11 @@ struct Args {
     bus: BusType,
     hd: bool,
     revs: u16,
+    step: Option<u8>,
     list_devices: bool,
     probe: bool,
     recover: bool,
+    verify: Option<PathBuf>,
     verbose: bool,
     help: bool,
 }
@@ -75,9 +77,11 @@ fn parse_args() -> Option<Args> {
         bus: BusType::Shugart, // GW F1 Plus работает по Shugart (для цифровых приводов 0-3)
         hd: false,
         revs: 3,
+        step: None,
         list_devices: false,
         probe: false,
         recover: false,
+        verify: None,
         verbose: false,
         help: false,
     };
@@ -93,9 +97,11 @@ fn parse_args() -> Option<Args> {
             }
             "--hd" => a.hd = true,
             "--revs" => a.revs = it.next()?.parse().ok()?,
+            "--step" => a.step = Some(it.next()?.parse().ok()?),
             "--list-devices" => a.list_devices = true,
             "--probe" => a.probe = true,
             "--recover" => a.recover = true,
+            "--verify" => a.verify = Some(PathBuf::from(it.next()?)),
             "-v" | "--verbose" => a.verbose = true,
             "-h" | "--help" | "-?" => a.help = true,
             _ => a.mountpoint = Some(arg),
@@ -125,6 +131,10 @@ fn print_help() {
         "  --hd               HD-режим: assert density-select (Shugart пин 2 low)",
         "                     Нужен для 5.25\" HD приводов (Mitsumi, Teac FD-55GFR и др.)",
         "  --revs <n>         Оборотов на дорожку (по умолчанию 3; больше = надёжнее)",
+        "  --step <n>         Физический шаг: 1 (по умолчанию, авто) или 2 (двойной шаг).",
+        "                     Двойной шаг нужен для 40-дорожечных 5.25\" DD-дискет (360К/180К)",
+        "                     в HD-приводе 96TPI. Авто-детект работает в большинстве случаев.",
+        "  --verify <dir>     Сравнить все файлы FS с файлами в <dir> (без монтирования).",
         "  -v, --verbose      Debug-лог: команды GW, PLL, секторы, BPB",
         "",
         "РАЗМОНТИРОВАТЬ:",
@@ -134,8 +144,10 @@ fn print_help() {
         "  floppy_mac /tmp/fd --device /dev/tty.usbmodemGW1 -v",
         "  floppy_mac /tmp/fd --device /dev/tty.usbmodemGW1 --unit 1 --hd -v",
         "  floppy_mac /tmp/fd --device /dev/tty.usbmodemGW1 --unit A",
+        "  floppy_mac /tmp/fd --device /dev/tty.usbmodemGW1 --step 2   # 40-дорожечная",
         "  floppy_mac --probe --device /dev/tty.usbmodemGW1 --unit 0 --hd -v",
         "  floppy_mac /tmp/fd --image disk.img",
+        "  floppy_mac --verify /Volumes/NO\\ NAME --image disk.img  # сверить образ с диском",
     ];
     for line in lines {
         println!("{line}");
@@ -204,6 +216,64 @@ fn probe(port: &str, unit: u8, bus: BusType, hd: bool, revs: u16) -> std::io::Re
     gw.set_motor(unit, false)?;
     gw.deselect()?;
     Ok(())
+}
+
+/// Пройти по дереву файловой системы и сравнить каждый файл с эталонным файлом
+/// в `ref_dir`. Возвращает `true`, если все файлы совпали.
+///
+/// Синтетический `.metadata_never_index` пропускается (его нет на реальном диске).
+fn verify_against(fs: &dyn Filesystem, ref_dir: &Path) -> bool {
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    let mut missing = 0usize;
+
+    // BFS: (относительный путь к каталогу, ino каталога)
+    let mut queue: Vec<(PathBuf, u64)> = vec![(PathBuf::new(), 1)];
+    while let Some((prefix, dir_ino)) = queue.pop() {
+        let Some(entries) = fs.readdir(dir_ino) else {
+            eprintln!("  warn: readdir({dir_ino}) вернул None");
+            continue;
+        };
+        for e in entries {
+            if e.name == ".metadata_never_index" {
+                continue; // виртуальный файл, не на диске
+            }
+            let rel = prefix.join(&e.name);
+            match e.kind {
+                FileKind::Dir => queue.push((rel, e.ino)),
+                FileKind::File => {
+                    let size = fs.getattr(e.ino)
+                        .map(|a| a.size)
+                        .unwrap_or(0);
+                    // Читаем весь файл за один раз (фактически — потоками через
+                    // fatfs; для дискет (max ~1 МБ) это разумно).
+                    let fs_data = fs.read(e.ino, 0, size.min(u32::MAX as u64) as u32)
+                        .unwrap_or_default();
+
+                    let ref_path = ref_dir.join(&rel);
+                    match std::fs::read(&ref_path) {
+                        Ok(ref_data) => {
+                            if fs_data == ref_data {
+                                println!("  OK   {}", rel.display());
+                                ok += 1;
+                            } else {
+                                println!(" FAIL  {}: {} байт из FS, {} байт в эталоне",
+                                    rel.display(), fs_data.len(), ref_data.len());
+                                fail += 1;
+                            }
+                        }
+                        Err(err) => {
+                            println!(" ???   {} — не найден в эталоне: {err}",
+                                rel.display());
+                            missing += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("Итого: {ok} OK, {fail} несовпадений, {missing} отсутствует в эталоне");
+    fail == 0 && missing == 0
 }
 
 fn main() -> ExitCode {
@@ -285,7 +355,7 @@ fn main() -> ExitCode {
             }
         }
         (None, Some(port)) => {
-            let src = match GreaseweazleSource::open(port, args.unit, args.bus, args.hd, args.revs, args.recover) {
+            let src = match GreaseweazleSource::open(port, args.unit, args.bus, args.hd, args.revs, args.recover, args.step) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Greaseweazle на {port}: {e}");
@@ -316,6 +386,17 @@ fn main() -> ExitCode {
         }
         (None, None) => (Box::new(HelloFs::new()), "hello-FS"),
     };
+
+    // --verify: сравнить все файлы FS с эталонной директорией, не монтируя.
+    if let Some(ref_dir) = &args.verify {
+        println!("Верификация: сравниваю с «{}»…", ref_dir.display());
+        let success = verify_against(inner.as_ref(), ref_dir);
+        drop(inner);
+        if let Some(h) = actor_handle {
+            h.join();
+        }
+        return if success { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+    }
 
     // Предчтение метаданных (решение 6d): прогреваем кэш дорожек корня
     // (boot+FAT+корневой каталог), чтобы первый просмотр в Finder был мгновенным.

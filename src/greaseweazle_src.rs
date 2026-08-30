@@ -125,6 +125,10 @@ pub struct GreaseweazleSource {
     /// Маппинг логической головки → физический head GW.
     /// [0,1] = прямой; [1,0] = инвертированный (сторона 0 читается head 1).
     head_map: [u8; 2],
+    /// Физический шаг на логическую дорожку.
+    /// 1 = 80-дорожечная дискета (3.5" или 5.25" HD/QD); 2 = 40-дорожечная
+    /// 5.25" DD (48 TPI) в 80-трековом HD-приводе (96 TPI) — нужен двойной шаг.
+    step: u8,
     cur_track: Option<(u16, u8)>,
     cur_sectors: HashMap<u8, mfm::Sector>,
     bad: BTreeSet<(u16, u8, u8)>,
@@ -138,6 +142,7 @@ impl GreaseweazleSource {
     ///  2. Если нашли BPB → FAT, head_map=[0,1].
     ///  3. Если нашли 256B-секторов ≥4 → TR-DOS, head_map=[0,1].
     ///  4. Иначе читаем головку 1 и повторяем → если удача, head_map=[1,0].
+    ///  5. Если cylinders ≤ 43 и step не задан явно — авто-детект шага (1 или 2).
     pub fn open(
         port: &str,
         unit: u8,
@@ -145,6 +150,7 @@ impl GreaseweazleSource {
         hd: bool,
         revs: u16,
         recover: bool,
+        forced_step: Option<u8>,
     ) -> io::Result<Self> {
         log::info!("подключаюсь к Greaseweazle на {port}…");
         let mut gw = Greaseweazle::open(port)?;
@@ -180,7 +186,8 @@ impl GreaseweazleSource {
         // Пытаемся определить формат по головке 0.
         if let Some((geom, disk_kind)) = detect_format(&secs0) {
             log::info!("формат определён по head 0: {disk_kind:?}");
-            return Ok(GreaseweazleSource::new(gw, geom, disk_kind, unit, revs, recover, [0, 1]));
+            let step = resolve_step(&mut gw, 0, revs, forced_step, &geom);
+            return Ok(GreaseweazleSource::new(gw, geom, disk_kind, unit, revs, recover, [0, 1], step));
         }
 
         // Головка 0 пустая или нечитаемая — пробуем головку 1.
@@ -192,7 +199,8 @@ impl GreaseweazleSource {
 
         if let Some((geom, disk_kind)) = detect_format(&secs1) {
             log::info!("формат определён по head 1: {disk_kind:?}, head_map=[1,0]");
-            return Ok(GreaseweazleSource::new(gw, geom, disk_kind, unit, revs, recover, [1, 0]));
+            let step = resolve_step(&mut gw, 1, revs, forced_step, &geom);
+            return Ok(GreaseweazleSource::new(gw, geom, disk_kind, unit, revs, recover, [1, 0], step));
         }
 
         // Формат не определён ни по одной из сторон.
@@ -220,6 +228,7 @@ impl GreaseweazleSource {
         revs: u16,
         recover: bool,
         head_map: [u8; 2],
+        step: u8,
     ) -> Self {
         GreaseweazleSource {
             gw,
@@ -229,6 +238,7 @@ impl GreaseweazleSource {
             revs,
             recover,
             head_map,
+            step,
             cur_track: None,
             cur_sectors: HashMap::new(),
             bad: BTreeSet::new(),
@@ -237,6 +247,7 @@ impl GreaseweazleSource {
 
     /// Физически прочитать дорожку. Логическая головка `head` транслируется в
     /// физическую через `head_map` (инвертирование для TR-DOS на головке 1).
+    /// Физический цилиндр = cyl * step (двойной шаг для 40-дорожечных дискет).
     fn read_track_into_cache(
         &mut self,
         cyl: u16,
@@ -245,15 +256,35 @@ impl GreaseweazleSource {
         fresh: bool,
     ) -> io::Result<()> {
         let phys_head = self.head_map[head as usize];
-        log::info!("чтение дорожки C{cyl} L{head}→P{phys_head} ({revs} об.)…");
+        let phys_cyl = ((cyl as u32) * (self.step as u32)).min(83) as u8;
+        log::info!(
+            "чтение дорожки C{cyl}→phys{phys_cyl} L{head}→P{phys_head} step={} ({revs} об.)…",
+            self.step
+        );
         self.gw.select(self.unit)?;
         self.gw.set_motor(self.unit, true)?;
-        self.gw.seek(cyl as u8)?;
+        self.gw.seek(phys_cyl)?;
         self.gw.select_head(phys_head)?;
         let flux = self.gw.read_flux(revs)?;
-        let sectors = mfm::decode_track(&flux);
+        let all_sectors = mfm::decode_track(&flux);
+
+        // Фильтрация по IDAM: пропускаем секторы, где в заголовке записан не тот
+        // цилиндр/головка. Это защита от попадания данных с соседней дорожки при
+        // неверном step или при физическом bleed-through.
+        let sectors: Vec<mfm::Sector> = all_sectors.into_iter().filter(|s| {
+            if s.id_crc_ok && (s.cyl != cyl as u8 || s.head != phys_head) {
+                log::warn!(
+                    "IDAM мимо: C{cyl} H{phys_head} ожидали, нашли C{} H{} R{} — пропускаем",
+                    s.cyl, s.head, s.sector
+                );
+                false
+            } else {
+                true
+            }
+        }).collect();
+
         let good = sectors.iter().filter(|s| s.data_crc_ok).count();
-        log::info!("C{cyl} H{head}: {} секторов, валидных {good}", sectors.len());
+        log::info!("C{cyl} H{head}: {} секторов (после фильтра IDAM), валидных {good}", sectors.len());
         if good < sectors.len() {
             for s in sectors.iter().filter(|s| !s.data_crc_ok) {
                 log::debug!("  битый: C{} H{} R{} {}B id_crc={}", s.cyl, s.head, s.sector, s.size(), s.id_crc_ok);
@@ -295,6 +326,66 @@ impl GreaseweazleSource {
             Err(e) => Err(e),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Определение физического шага (double-stepping)
+// ---------------------------------------------------------------------------
+
+/// Зондировать физические цилиндры 1 и 2 и вернуть шаг, при котором IDAM
+/// говорит C=1 (т.е. это действительно вторая логическая дорожка).
+///
+/// Для 40-дорожечной 48TPI дискеты в 96TPI HD-приводе:
+///   - физ.цилиндр 1 → между дорожками → нет секторов с IDAM C=1
+///   - физ.цилиндр 2 → вторая дорожка диска → IDAM C=1 → step=2
+fn probe_step(gw: &mut Greaseweazle, phys_head: u8, revs: u16) -> u8 {
+    let _ = gw.select_head(phys_head);
+    for (phys_cyl, step) in [(1u8, 1u8), (2u8, 2u8)] {
+        if gw.seek(phys_cyl).is_err() {
+            continue;
+        }
+        if let Ok(flux) = gw.read_flux(revs) {
+            let secs = mfm::decode_track(&flux);
+            let cyls: Vec<u8> = secs.iter().filter(|s| s.id_crc_ok).map(|s| s.cyl).collect();
+            log::debug!("probe_step: физ.{phys_cyl} → IDAM C-значения: {cyls:?}");
+            if secs.iter().any(|s| s.id_crc_ok && s.cyl == 1) {
+                log::info!(
+                    "шаг дорожки: {step} (физ.цилиндр {phys_cyl} содержит IDAM C=1{})",
+                    if step == 2 { " — 40-дорожечная дискета в HD-приводе" } else { "" }
+                );
+                return step;
+            }
+        }
+    }
+    log::warn!("не удалось определить шаг по зонду (C=1 не найден ни на физ.1, ни на 2), используем 1");
+    1
+}
+
+/// Вернуть шаг дорожки с учётом явного override и геометрии.
+///
+/// - Если `forced_step` задан — используем его без зонда.
+/// - Если cylinders > 43 — диск явно 80+ дорожек, step=1.
+/// - Иначе — вызываем `probe_step` для авто-детекта.
+fn resolve_step(
+    gw: &mut Greaseweazle,
+    phys_head: u8,
+    revs: u16,
+    forced_step: Option<u8>,
+    geom: &Geometry,
+) -> u8 {
+    if let Some(s) = forced_step {
+        log::info!("шаг задан явно: {s}");
+        return s;
+    }
+    if geom.cylinders > 43 {
+        log::info!("цилиндров {}: шаг 1 (80-дорожечный формат)", geom.cylinders);
+        return 1;
+    }
+    log::info!(
+        "{}≤43 цилиндра: запускаю авто-детект шага (одиночный или двойной)…",
+        geom.cylinders
+    );
+    probe_step(gw, phys_head, revs)
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +525,33 @@ mod tests {
         assert_eq!(lba_to_chs(&g, 18), (0, 1, 1));
         assert_eq!(lba_to_chs(&g, 36), (1, 0, 1));
         assert_eq!(lba_to_chs(&g, 2879), (79, 1, 18));
+    }
+
+    /// 360К DS DD 5.25": 40 цилиндров, 2 стороны, 9 секторов.
+    /// Физический цилиндр при step=2: logical_cyl * 2.
+    #[test]
+    fn lba_chs_360k_double_step() {
+        let g = Geometry {
+            cylinders: 40,
+            heads: 2,
+            sectors_per_track: 9,
+            bytes_per_sector: 512,
+            total_sectors: 720,
+        };
+        // Логические CHS
+        assert_eq!(lba_to_chs(&g, 0), (0, 0, 1));   // cyl=0 → phys=0*2=0
+        assert_eq!(lba_to_chs(&g, 8), (0, 0, 9));
+        assert_eq!(lba_to_chs(&g, 9), (0, 1, 1));
+        assert_eq!(lba_to_chs(&g, 17), (0, 1, 9));
+        assert_eq!(lba_to_chs(&g, 18), (1, 0, 1));   // cyl=1 → phys=1*2=2
+        assert_eq!(lba_to_chs(&g, 719), (39, 1, 9)); // cyl=39 → phys=39*2=78
+
+        // Физический цилиндр при step=2
+        let step: u8 = 2;
+        let (cyl, _, _) = lba_to_chs(&g, 18);
+        assert_eq!((cyl as u32 * step as u32) as u8, 2); // logical 1 → physical 2
+        let (cyl, _, _) = lba_to_chs(&g, 719);
+        assert_eq!((cyl as u32 * step as u32) as u8, 78); // logical 39 → physical 78
     }
 
     #[test]
