@@ -1,4 +1,4 @@
-# floppy-mac
+# Bad Floppy Driver
 
 Read-only macOS FUSE-драйвер для монтирования физических дискет прямо в Finder через [Greaseweazle](https://github.com/keirf/greaseweazle). Написан на Rust: флукс с адаптера → собственный MFM-декодер → FAT / TR-DOS → macFUSE. Работает без kext, без Xcode, на Full Security (Apple Silicon). Поддерживает живые приводы через Greaseweazle и готовые образы `.img`.
 
@@ -75,23 +75,19 @@ floppy_mac --list-devices
 Сначала установите [macFUSE](https://macfuse.github.io/):
 
 ```sh
+brew tap smartlime/bad-floppy-driver
 brew install --cask macfuse
-```
-
-Затем добавьте tap и установите:
-
-```sh
-brew tap smartlime/floppy-mac
-brew install floppy-mac
+brew install bad-floppy-driver
 ```
 
 ### Готовый бинарник
 
-Скачайте `floppy_mac` со страницы [Releases](https://github.com/smartlime/mac-floppy-driver/releases), сделайте исполняемым и положите куда-нибудь в `$PATH`:
+Готовый бинарник выпускается для Apple Silicon. Для macOS на Intel драйвер пока надо собирать из исходников. Скачайте архив со страницы [Releases](https://github.com/smartlime/bad-floppy-driver/releases) и установите `floppy_mac`:
 
 ```sh
-chmod +x floppy_mac
-sudo mv floppy_mac /usr/local/bin/
+curl -LO https://github.com/smartlime/bad-floppy-driver/releases/download/v0.1.0/bad-floppy-driver-v0.1.0-macos-arm64.tar.gz
+tar -xzf bad-floppy-driver-v0.1.0-macos-arm64.tar.gz
+sudo install -m 755 floppy_mac /usr/local/bin/floppy_mac
 ```
 
 ### Из исходников
@@ -99,8 +95,8 @@ sudo mv floppy_mac /usr/local/bin/
 Требования: Rust, [macFUSE 5+](https://macfuse.github.io/).
 
 ```sh
-git clone https://github.com/smartlime/mac-floppy-driver
-cd mac-floppy-driver
+git clone https://github.com/smartlime/bad-floppy-driver
+cd bad-floppy-driver
 cargo build --release
 # бинарник: target/release/floppy_mac
 ```
@@ -113,7 +109,7 @@ cargo build --release
 cargo test
 ```
 
-13 unit-тестов покрывают: MFM-декодер (CRC, джиттер, полная дорожка 18 секторов), протокол Greaseweazle на уровне wire, кэширующий актор, разбор FAT BPB, конвертацию времени FAT.
+15 unit-тестов покрывают: MFM-декодер (CRC, джиттер, полная дорожка 18 секторов), протокол Greaseweazle на уровне wire, кэширующий актор, разбор FAT BPB, конвертацию времени FAT и двойной шаг дорожек для 40-дорожечных дискет.
 
 ---
 
@@ -156,4 +152,4 @@ GPL-2.0-or-later (следствие линковки с macFUSE).
 
 ## Обратная связь
 
-Замечания, баги и патчи — в [Issues](https://github.com/smartlime/mac-floppy-driver/issues) или в Telegram-канал [@varnakov_ru](https://t.me/varnakov_ru).
+Замечания, баги и патчи — в [Issues](https://github.com/smartlime/bad-floppy-driver/issues) или в Telegram-канал [@varnakov_ru](https://t.me/varnakov_ru).
