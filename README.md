@@ -76,6 +76,7 @@ floppy_mac --list-devices
 
 ```sh
 brew tap smartlime/bad-floppy-driver
+brew trust smartlime/bad-floppy-driver
 brew install --cask macfuse
 brew install bad-floppy-driver
 ```
